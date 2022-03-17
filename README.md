@@ -2,13 +2,11 @@ A super simple service that accepts webhooks for you.
 
 ```mermaid
 sequenceDiagram
-    participant E as Exernal Service
-    participant W as Webhook Mailbox
     participant Y as Your Service
-	Y->>W: Check For Webhooks
-    W-->>Y: None
-    E->>W: Webhook
+    participant W as Webhook Mailbox
+    participant E as Exernal Service
     Y->>W: Check For Webhooks
+    E->>W: Webhook
     W-->>Y: Webhook Payload
 ```
 
