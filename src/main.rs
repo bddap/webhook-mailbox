@@ -12,10 +12,8 @@
 //! Get `/hook/<address>` is ignored. Only post works. Maybe this is what we want?
 //!
 //! Does the user want to be able to get the http headers that were sent to `/hook/<address>`
-//!
-//! Want to move off of internal polling in `/watch`. Some sort of subscribe system would
-//! be good.
 
+use futures::channel::oneshot;
 use hex::FromHex;
 use rocket::{
     data::ByteUnit,
@@ -24,11 +22,8 @@ use rocket::{
     Data, Request, Rocket,
 };
 use sha2::Digest;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-use std::{
-    collections::{HashMap, VecDeque},
-    time::Duration,
-};
 
 lazy_static::lazy_static! {
     /// This is an example for using doc comment attributes
@@ -45,15 +40,10 @@ fn rocket_build() -> Rocket<rocket::Build> {
 }
 
 #[rocket::get("/watch")]
-async fn watch(bearer: Mailbox) -> Vec<u8> {
-    let addr = bearer.hash();
-    // just keeps checking the mailbox
-    loop {
-        if let Some(ret) = DB.pop(addr) {
-            return ret;
-        }
-        rocket::tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+async fn watch(bearer: MailboxKey) -> Vec<u8> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    DB.subscribe(bearer, tx);
+    rx.await.unwrap()
 }
 
 #[rocket::post("/hook/<address>", data = "<bod>")]
@@ -68,37 +58,65 @@ async fn hook(
         .map_err(|e| (Status::BadRequest, format!("{e}")))?;
     let address = address.map_err(|e| (Status::BadRequest, e))?;
 
-    DB.put(address, bytes.value);
+    DB.insert(address, bytes.value);
 
     Ok("ok")
 }
 
 #[derive(Default)]
-struct Db {
-    mailbox: Mutex<HashMap<Address, VecDeque<Vec<u8>>>>,
+struct MailBox {
+    backlog: VecDeque<Vec<u8>>,
+    pending_senders: VecDeque<oneshot::Sender<Vec<u8>>>,
 }
 
-impl Db {
-    fn pop(&self, addr: Address) -> Option<Vec<u8>> {
-        use std::collections::hash_map::Entry;
-        match DB.mailbox.lock().unwrap().entry(addr) {
-            Entry::Occupied(mut occ) => {
-                let queue = occ.get_mut();
-                assert_ne!(queue.len(), 0);
-                let ret = queue.pop_front().unwrap();
-                if queue.is_empty() {
-                    occ.remove();
-                }
-                Some(ret)
-            }
-            Entry::Vacant(_) => None,
+impl MailBox {
+    // TODO instead of accepting a sender, this function should return a Reciever or an
+    // impl Future<Item = Vec<u8>>
+    fn subscribe(&mut self, tx: oneshot::Sender<Vec<u8>>) {
+        if let Some(message) = self.backlog.pop_front() {
+            let _ = tx.send(message);
+        } else {
+            self.pending_senders.push_back(tx)
         }
     }
 
-    fn put(&self, addr: Address, body: Vec<u8>) {
-        let mut mailbox = DB.mailbox.lock().unwrap();
-        let queue = mailbox.entry(addr).or_insert_with(Default::default);
-        queue.push_back(body);
+    fn insert(&mut self, body: Vec<u8>) {
+        if let Some(tx) = self.pending_senders.pop_front() {
+            let _ = tx.send(body);
+        } else {
+            self.backlog.push_back(body);
+        }
+    }
+
+    /// an inactive mailbox can be deleted
+    fn active(&self) -> bool {
+        !(self.backlog.is_empty() && self.pending_senders.is_empty())
+    }
+}
+
+#[derive(Default)]
+struct Db {
+    mailboxen: Mutex<HashMap<Address, MailBox>>,
+}
+
+impl Db {
+    fn insert(&self, addr: Address, body: Vec<u8>) {
+        let mut mailboxen = DB.mailboxen.lock().unwrap();
+        let mailbox = mailboxen.entry(addr).or_insert_with(Default::default);
+        mailbox.insert(body);
+        if !mailbox.active() {
+            mailboxen.remove(&addr);
+        }
+    }
+
+    fn subscribe(&self, mailbox_key: MailboxKey, tx: oneshot::Sender<Vec<u8>>) {
+        let addr = mailbox_key.hash();
+        let mut mailboxen = DB.mailboxen.lock().unwrap();
+        let mailbox = mailboxen.entry(addr).or_insert_with(Default::default);
+        mailbox.subscribe(tx);
+        if !mailbox.active() {
+            mailboxen.remove(&addr);
+        }
     }
 }
 
@@ -116,11 +134,11 @@ impl<'a> FromParam<'a> for Address {
     }
 }
 
-struct Mailbox {
+struct MailboxKey {
     token: [u8; 32],
 }
 
-impl Mailbox {
+impl MailboxKey {
     fn hash(&self) -> Address {
         Address {
             addr: sha2::Sha256::digest(self.token).into(),
@@ -129,7 +147,7 @@ impl Mailbox {
 }
 
 #[rocket::async_trait]
-impl<'r> FromRequest<'r> for Mailbox {
+impl<'r> FromRequest<'r> for MailboxKey {
     type Error = &'static str;
 
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, Self::Error> {
@@ -150,7 +168,7 @@ impl<'r> FromRequest<'r> for Mailbox {
             Ok(t) => t,
             Err(_) => return failure,
         };
-        Outcome::Success(Mailbox { token })
+        Outcome::Success(MailboxKey { token })
     }
 }
 
@@ -158,11 +176,12 @@ impl<'r> FromRequest<'r> for Mailbox {
 mod tests {
     use hex::ToHex;
     use rocket::http::{ContentType, Header};
+    use std::time::Duration;
 
     use super::*;
 
-    impl From<Mailbox> for Header<'static> {
-        fn from(mb: Mailbox) -> Self {
+    impl From<MailboxKey> for Header<'static> {
+        fn from(mb: MailboxKey) -> Self {
             Header::new(
                 AUTHORIZATION.as_str(),
                 format!("Bearer {}", mb.token.encode_hex::<String>()),
@@ -170,8 +189,8 @@ mod tests {
         }
     }
 
-    fn rand_mailbox() -> Mailbox {
-        Mailbox {
+    fn rand_mailbox() -> MailboxKey {
+        MailboxKey {
             token: rand::random(),
         }
     }
