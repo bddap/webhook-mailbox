@@ -15,19 +15,26 @@ No need to set up an account. Your service can just allocate a mailbox at will.
 Client example:
 
 ```python
-mailbox = generate_32_random_bytes()
-address = sha256_hash(mailbox)
+#!/usr/bin/env python3
+
+import secrets
+import hashlib
+import requests
+
+mailbox = secrets.token_bytes(32)
+address = hashlib.sha256(mailbox).digest()
 
 requests.post(
-    'https://external-service.example.com/',
-    data={'webhook_url': 'https://webhook-mailbox.com/hook/' + hex(address)},
+    "https://external-service.example.com/",
+    json={"webhook_url": "https://webhook-mailbox.com/hook/" + address.hex()},
 )
 
 message = requests.get(
-    'https://webhook-mailbox.com/watch/',
-    headers={"Authorization": "Bearer " + hex(mailbox)},
+    "https://webhook-mailbox.com/watch/",
+    headers={"Authorization": "Bearer " + mailbox.hex()},
 )
 ```
+
 ## Current State
 
 pre-alpha. It runs, in theory it should work, but the service doesn't to much to protect against
