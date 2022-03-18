@@ -49,14 +49,12 @@ async fn watch(bearer: Mailbox) -> Vec<u8> {
     let addr = bearer.hash();
     // just keeps checking the mailbox
     loop {
-        match DB.pop(addr) {
-            Some(ret) => return ret,
-            None => {}
+        if let Some(ret) = DB.pop(addr) {
+            return ret;
         }
         rocket::tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
-
 
 #[rocket::post("/hook/<address>", data = "<bod>")]
 async fn hook(
@@ -75,16 +73,9 @@ async fn hook(
     Ok("ok")
 }
 
+#[derive(Default)]
 struct Db {
     mailbox: Mutex<HashMap<Address, VecDeque<Vec<u8>>>>,
-}
-
-impl Default for Db {
-    fn default() -> Self {
-        Self {
-            mailbox: Default::default(),
-        }
-    }
 }
 
 impl Db {
@@ -106,7 +97,7 @@ impl Db {
 
     fn put(&self, addr: Address, body: Vec<u8>) {
         let mut mailbox = DB.mailbox.lock().unwrap();
-        let queue = mailbox.entry(addr).or_insert(Default::default());
+        let queue = mailbox.entry(addr).or_insert_with(Default::default);
         queue.push_back(body);
     }
 }
