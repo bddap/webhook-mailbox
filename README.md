@@ -26,20 +26,24 @@ address = hashlib.sha256(mailbox).digest()
 
 requests.post(
     "https://external-service.example.com/",
-    json={"webhook_url": "https://webhook-mailbox.com/hook/" + address.hex()},
+    json={"webhook_url": "https://webhook-mailbox.com/api/hook/" + address.hex()},
 )
 
 message = requests.get(
-    "https://webhook-mailbox.com/watch/",
+    "https://webhook-mailbox.com/api/watch/",
     headers={"Authorization": "Bearer " + mailbox.hex()},
 )
 ```
 
 ## Current State
 
-pre-alpha. It runs, in theory it should work, but the service doesn't to much to protect against
-abuse from WAN. Messages aren't stored persistently. There's no way to perform updates while
-maintaining high availability. etc...
+pre-alpha. It works (for some definition of "works"), but the service doesn't to much to
+protect against abuse from WAN. Messages aren't stored persistently. When memory fills
+oom will cause pending messages to be lost. There's no way to perform updates while
+maintaining high availability. The api isn't stable. It makes weird banging noises when
+accelerating. etc...
+
+That said, this app is live at `https://webhook-mailbox.com/api`. You can try it out now!
 
 ## License
 
