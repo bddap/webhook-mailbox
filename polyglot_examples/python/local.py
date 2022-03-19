@@ -22,3 +22,5 @@ result = requests.get(
     headers={"Authorization": "Bearer " + mailbox.hex()},
 )
 assert result.text == '{"message": "hey!"}'
+
+print("It worked!")
