@@ -4,13 +4,18 @@ A super simple service that accepts webhooks for you.
 sequenceDiagram
     participant Y as Your Service
     participant W as Webhook Mailbox
-    participant E as Exernal Service
+    participant E as External Service
     Y->>W: Check For Webhooks
     E->>W: Webhook
     W-->>Y: Webhook Payload
 ```
 
 No need to set up an account. Your service can just allocate a mailbox at will.
+
+Nothing is stored. A webhook is delivered only to a client already waiting on `/watch` for
+its mailbox; otherwise the sender gets a 503 and the body is dropped. Delivery is best-effort:
+start watching before the webhook can fire. A watch that receives nothing for 30 seconds ends
+with a 408; watch again to keep waiting.
 
 Client example:
 
@@ -37,9 +42,8 @@ message = requests.get(
 
 ## Current State
 
-pre-alpha. It works (for some definition of "works"), but the service doesn't to much to
-protect against abuse from WAN. Messages aren't stored persistently. When memory fills
-oom will cause pending messages to be lost. There's no way to perform updates while
+pre-alpha. It works (for some definition of "works"), but the service doesn't do much to
+protect against abuse from WAN. There's no way to perform updates while
 maintaining high availability. The api isn't stable. It makes weird banging noises when
 accelerating. etc...
 

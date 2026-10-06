@@ -1,82 +1,98 @@
-use futures::channel::oneshot;
+use rocket::tokio::{sync::oneshot, time::timeout};
 use sha2::Digest;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-use std::{
-    collections::{HashMap, VecDeque},
-    iter::FromIterator,
-};
+use std::time::Duration;
 
-#[derive(Default)]
-struct Mailbox {
-    pending_senders: VecDeque<oneshot::Sender<Vec<u8>>>,
-    pending_recievers: VecDeque<oneshot::Receiver<Vec<u8>>>,
-}
+/// Rocket keeps a handler running after its client disconnects, so an abandoned watch
+/// is only reclaimed by this timeout or a delivery; the two constants bound the state.
+pub const MAX_WATCHERS: usize = 10_000;
+pub const WATCH_TIMEOUT: Duration = Duration::from_secs(30);
 
-impl Mailbox {
-    fn receive(&mut self) -> oneshot::Receiver<Vec<u8>> {
-        match self.pending_recievers.pop_front() {
-            Some(rx) => rx,
-            None => {
-                let (tx, rx) = oneshot::channel();
-                self.pending_senders.push_back(tx);
-                rx
-            }
-        }
-    }
-
-    fn sender(&mut self) -> oneshot::Sender<Vec<u8>> {
-        match self.pending_senders.pop_front() {
-            Some(tx) => tx,
-            None => {
-                let (tx, rx) = oneshot::channel();
-                self.pending_recievers.push_back(rx);
-                tx
-            }
-        }
-    }
-
-    fn send(&mut self, body: Vec<u8>) {
-        let mut body = body;
-        loop {
-            match self.sender().send(body) {
-                Ok(()) => break,
-                Err(b) => {
-                    body = b;
-                }
-            }
-        }
-    }
-
-    /// an inactive mailbox can be deleted
-    fn active(&self) -> bool {
-        !(self.pending_recievers.is_empty() && self.pending_senders.is_empty())
-    }
-}
-
+/// Holds only the watchers currently waiting; a hook body is handed straight to one of
+/// them and never stored.
 #[derive(Default)]
 pub struct Db {
-    mailboxen: Mutex<HashMap<Address, Mailbox>>,
+    watchers: Mutex<Watchers>,
+}
+
+#[derive(Default)]
+struct Watchers {
+    count: usize,
+    by_address: HashMap<Address, VecDeque<oneshot::Sender<Vec<u8>>>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WatchError {
+    Full,
+    TimedOut,
+    Closed,
+}
+
+struct Registration<'a> {
+    db: &'a Db,
+    addr: Address,
+    rx: oneshot::Receiver<Vec<u8>>,
+}
+
+impl Drop for Registration<'_> {
+    fn drop(&mut self) {
+        self.rx.close();
+        let mut watchers = self.db.watchers.lock().unwrap();
+        let Watchers { count, by_address } = &mut *watchers;
+        if let Some(queue) = by_address.get_mut(&self.addr) {
+            let before = queue.len();
+            queue.retain(|tx| !tx.is_closed());
+            *count -= before - queue.len();
+            if queue.is_empty() {
+                by_address.remove(&self.addr);
+            }
+        }
+    }
 }
 
 impl Db {
-    pub fn receive(&self, mailbox_key: MailboxKey) -> oneshot::Receiver<Vec<u8>> {
-        let mut mailboxen = self.mailboxen.lock().unwrap();
+    pub async fn receive(&self, mailbox_key: MailboxKey) -> Result<Vec<u8>, WatchError> {
         let addr = mailbox_key.hash();
-        let mailbox = mailboxen.entry(addr).or_insert_with(Default::default);
-        let ret = mailbox.receive();
-        if !mailbox.active() {
-            mailboxen.remove(&addr);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut watchers = self.watchers.lock().unwrap();
+            if watchers.count >= MAX_WATCHERS {
+                return Err(WatchError::Full);
+            }
+            watchers.count += 1;
+            watchers.by_address.entry(addr).or_default().push_back(tx);
         }
-        ret
+        let mut registration = Registration { db: self, addr, rx };
+        match timeout(WATCH_TIMEOUT, &mut registration.rx).await {
+            Ok(Ok(body)) => Ok(body),
+            Ok(Err(_)) => Err(WatchError::Closed),
+            Err(_) => Err(WatchError::TimedOut),
+        }
     }
 
-    pub fn send(&self, addr: Address, body: Vec<u8>) {
-        let mut mailboxen = self.mailboxen.lock().unwrap();
-        let mailbox = mailboxen.entry(addr).or_insert_with(Default::default);
-        mailbox.send(body);
-        if !mailbox.active() {
-            mailboxen.remove(&addr);
+    pub fn send(&self, addr: Address, mut body: Vec<u8>) -> Result<(), Vec<u8>> {
+        let mut watchers = self.watchers.lock().unwrap();
+        let Watchers { count, by_address } = &mut *watchers;
+        if let Some(queue) = by_address.get_mut(&addr) {
+            while let Some(tx) = queue.pop_front() {
+                *count -= 1;
+                match tx.send(body) {
+                    Ok(()) => return Ok(()),
+                    Err(b) => body = b,
+                }
+            }
         }
+        Err(body)
+    }
+
+    #[cfg(test)]
+    pub fn retained(&self) -> usize {
+        let watchers = self.watchers.lock().unwrap();
+        let queued: Vec<usize> = watchers.by_address.values().map(VecDeque::len).collect();
+        assert!(!queued.contains(&0));
+        assert_eq!(watchers.count, queued.iter().sum::<usize>());
+        watchers.count
     }
 }
 
@@ -114,5 +130,45 @@ impl MailboxKey {
         Address {
             addr: sha2::Sha256::digest(self.token).into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn watches_never_dropped_are_capped_then_expire() {
+        let db: &'static Db = Box::leak(Box::default());
+        let watches: Vec<_> = (0..2 * MAX_WATCHERS)
+            .map(|_| {
+                let key = MailboxKey {
+                    token: rand::random(),
+                };
+                rocket::tokio::spawn(db.receive(key))
+            })
+            .collect();
+        rocket::tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(db.retained(), MAX_WATCHERS);
+
+        let outcomes = rocket::tokio::time::timeout(2 * WATCH_TIMEOUT, async {
+            let mut outcomes = Vec::new();
+            for watch in watches {
+                outcomes.push(watch.await.unwrap());
+            }
+            outcomes
+        })
+        .await
+        .expect("every watch ends within the timeout");
+        let full = outcomes
+            .iter()
+            .filter(|o| **o == Err(WatchError::Full))
+            .count();
+        let timed_out = outcomes
+            .iter()
+            .filter(|o| **o == Err(WatchError::TimedOut))
+            .count();
+        assert_eq!((full, timed_out), (MAX_WATCHERS, MAX_WATCHERS));
+        assert_eq!(db.retained(), 0);
     }
 }
