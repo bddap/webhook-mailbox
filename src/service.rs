@@ -5,9 +5,16 @@ use tokio::sync::oneshot;
 
 pub const MAX_WATCHERS: usize = 10_000;
 
-#[derive(Default)]
 pub struct Db {
-    watchers: Mutex<Watchers>,
+    watchers: Mutex<Option<Watchers>>,
+}
+
+impl Default for Db {
+    fn default() -> Self {
+        Db {
+            watchers: Mutex::new(Some(Watchers::default())),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -16,7 +23,10 @@ struct Watchers {
     by_address: HashMap<Address, VecDeque<oneshot::Sender<Vec<u8>>>>,
 }
 
-pub struct Full;
+pub enum Unavailable {
+    Full,
+    Closing,
+}
 
 struct Registration<'a> {
     db: &'a Db,
@@ -28,7 +38,9 @@ impl Drop for Registration<'_> {
     fn drop(&mut self) {
         self.rx.close();
         let mut watchers = self.db.watchers.lock().unwrap();
-        let Watchers { count, by_address } = &mut *watchers;
+        let Some(Watchers { count, by_address }) = &mut *watchers else {
+            return;
+        };
         if let Some(queue) = by_address.get_mut(&self.addr) {
             let before = queue.len();
             queue.retain(|tx| !tx.is_closed());
@@ -41,26 +53,33 @@ impl Drop for Registration<'_> {
 }
 
 impl Db {
-    pub async fn receive(&self, mailbox_key: MailboxKey) -> Result<Vec<u8>, Full> {
+    pub async fn receive(&self, mailbox_key: MailboxKey) -> Result<Vec<u8>, Unavailable> {
         let addr = mailbox_key.hash();
         let (tx, rx) = oneshot::channel();
         {
             let mut watchers = self.watchers.lock().unwrap();
+            let watchers = watchers.as_mut().ok_or(Unavailable::Closing)?;
             if watchers.count >= MAX_WATCHERS {
-                return Err(Full);
+                return Err(Unavailable::Full);
             }
             watchers.count += 1;
             watchers.by_address.entry(addr).or_default().push_back(tx);
         }
         let mut registration = Registration { db: self, addr, rx };
-        Ok((&mut registration.rx)
+        (&mut registration.rx)
             .await
-            .expect("a waiting watch's sender is consumed only by send"))
+            .map_err(|_| Unavailable::Closing)
+    }
+
+    pub fn close(&self) {
+        self.watchers.lock().unwrap().take();
     }
 
     pub fn send(&self, addr: Address, mut body: Vec<u8>) -> Result<(), Vec<u8>> {
         let mut watchers = self.watchers.lock().unwrap();
-        let Watchers { count, by_address } = &mut *watchers;
+        let Some(Watchers { count, by_address }) = &mut *watchers else {
+            return Err(body);
+        };
         if let Some(queue) = by_address.get_mut(&addr) {
             while let Some(tx) = queue.pop_front() {
                 *count -= 1;
@@ -76,6 +95,9 @@ impl Db {
     #[cfg(test)]
     pub fn retained(&self) -> usize {
         let watchers = self.watchers.lock().unwrap();
+        let Some(watchers) = &*watchers else {
+            return 0;
+        };
         let queued: Vec<usize> = watchers.by_address.values().map(VecDeque::len).collect();
         assert!(!queued.contains(&0));
         assert_eq!(watchers.count, queued.iter().sum::<usize>());

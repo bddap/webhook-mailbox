@@ -1,5 +1,8 @@
+use std::future::{poll_fn, Future, IntoFuture};
 use std::os::fd::{AsFd, OwnedFd};
+use std::pin::pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use axum::{
@@ -7,7 +10,12 @@ use axum::{
     extract::{
         connect_info::Connected, ConnectInfo, DefaultBodyLimit, FromRequestParts, Path, State,
     },
-    http::{header::AUTHORIZATION, request::Parts, StatusCode},
+    http::{
+        header::{AUTHORIZATION, RETRY_AFTER},
+        request::Parts,
+        StatusCode,
+    },
+    response::{IntoResponse, Response},
     routing::{get, post},
     serve::IncomingStream,
     Router,
@@ -16,9 +24,13 @@ use hex::FromHex;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{unix::AsyncFd, Interest};
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
+use tokio::time::timeout;
 
-use crate::service::{Address, Db, Full, MailboxKey};
+use crate::service::{Address, Db, MailboxKey, Unavailable};
 
+pub const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+const RETRY_AFTER_SECONDS: &str = "1";
 const MAX_HOOK_BYTES: usize = 4096;
 const KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
@@ -72,7 +84,11 @@ async fn hung_up(socket: &AsyncFd<OwnedFd>) {
     }
 }
 
-pub async fn serve(listener: TcpListener, db: Arc<Db>) -> std::io::Result<()> {
+pub async fn serve(
+    listener: TcpListener,
+    db: Arc<Db>,
+    shutdown: impl Future<Output = ()>,
+) -> std::io::Result<()> {
     SockRef::from(&listener).set_tcp_keepalive(
         &TcpKeepalive::new()
             .with_time(KEEPALIVE_IDLE)
@@ -84,25 +100,56 @@ pub async fn serve(listener: TcpListener, db: Arc<Db>) -> std::io::Result<()> {
         .route("/hook/{address}", post(hook))
         .route("/hook/{address}/", post(hook))
         .layer(DefaultBodyLimit::max(MAX_HOOK_BYTES))
-        .with_state(db);
-    axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<Peer>(),
+        .with_state(db.clone());
+    let stop_serving = Arc::new(Notify::new());
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<Peer>(),
+        )
+        .with_graceful_shutdown({
+            let stop_serving = stop_serving.clone();
+            async move { stop_serving.notified().await }
+        })
+        .into_future(),
+    );
+    shutdown.await;
+    db.close();
+    stop_serving.notify_one();
+    timeout(DRAIN_DEADLINE, server)
+        .await
+        .map_or(Ok(()), |joined| {
+            joined.unwrap_or_else(|panicked| Err(std::io::Error::other(panicked)))
+        })
+}
+
+fn try_again() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(RETRY_AFTER, RETRY_AFTER_SECONDS)],
     )
-    .await
+        .into_response()
 }
 
 async fn watch(
     State(db): State<Arc<Db>>,
     ConnectInfo(Peer(socket)): ConnectInfo<Peer>,
     key: MailboxKey,
-) -> Result<Vec<u8>, StatusCode> {
-    let socket = socket.ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    tokio::select! {
-        biased;
-        received = db.receive(key) => received.map_err(|Full| StatusCode::TOO_MANY_REQUESTS),
-        () = hung_up(&socket) => Err(StatusCode::BAD_REQUEST),
-    }
+) -> Result<Vec<u8>, Response> {
+    let socket = socket.ok_or_else(try_again)?;
+    let mut received = pin!(db.receive(key));
+    let mut hung_up = pin!(hung_up(&socket));
+    poll_fn(|cx| match received.as_mut().poll(cx) {
+        Poll::Ready(received) => Poll::Ready(received.map_err(|unavailable| match unavailable {
+            Unavailable::Full => StatusCode::TOO_MANY_REQUESTS.into_response(),
+            Unavailable::Closing => try_again(),
+        })),
+        Poll::Pending => hung_up
+            .as_mut()
+            .poll(cx)
+            .map(|()| Err(StatusCode::BAD_REQUEST.into_response())),
+    })
+    .await
 }
 
 async fn hook(
@@ -126,9 +173,11 @@ async fn hook(
 mod tests {
     use hex::ToHex;
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
-    use tokio::time::{sleep, timeout};
+    use tokio::net::{TcpSocket, TcpStream};
+    use tokio::sync::oneshot;
+    use tokio::time::{sleep, Instant};
 
     use super::*;
     use crate::service::MAX_WATCHERS;
@@ -138,14 +187,49 @@ mod tests {
 
     struct Response {
         status: u16,
+        head: String,
         body: Vec<u8>,
+    }
+
+    struct Process {
+        server: SocketAddr,
+        db: Arc<Db>,
+        terminate: oneshot::Sender<()>,
+        exited: oneshot::Receiver<Instant>,
+    }
+
+    fn spawn_process() -> Process {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = listener.local_addr().unwrap();
+        let db = Arc::new(Db::default());
+        let (terminate, terminated) = oneshot::channel();
+        let (exit, exited) = oneshot::channel();
+        let served = db.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime
+                .block_on(async {
+                    let listener = TcpListener::from_std(listener).unwrap();
+                    serve(listener, served, async { terminated.await.unwrap() }).await
+                })
+                .unwrap();
+            drop(runtime);
+            exit.send(Instant::now()).unwrap();
+        });
+        Process {
+            server,
+            db,
+            terminate,
+            exited,
+        }
     }
 
     async fn spawn_server() -> (SocketAddr, Arc<Db>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server = listener.local_addr().unwrap();
         let db = Arc::new(Db::default());
-        tokio::spawn(serve(listener, db.clone()));
+        tokio::spawn(serve(listener, db.clone(), std::future::pending()));
         (server, db)
     }
 
@@ -169,15 +253,23 @@ mod tests {
         send_raw(server, &[head.as_bytes(), body].concat()).await
     }
 
-    async fn read_response(mut stream: TcpStream) -> Response {
+    async fn read_response(stream: TcpStream) -> Response {
+        try_read_response(stream).await.expect("no response")
+    }
+
+    async fn try_read_response(mut stream: TcpStream) -> Option<Response> {
         let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).await.unwrap();
+        stream.read_to_end(&mut raw).await.ok()?;
+        if raw.is_empty() {
+            return None;
+        }
         let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
         let status = std::str::from_utf8(&raw[9..12]).unwrap().parse().unwrap();
-        Response {
+        Some(Response {
             status,
+            head: String::from_utf8(raw[..split].to_vec()).unwrap(),
             body: raw[split + 4..].to_vec(),
-        }
+        })
     }
 
     async fn request(server: SocketAddr, head: &str, body: &[u8]) -> Response {
@@ -352,5 +444,127 @@ mod tests {
             watch.abort();
         }
         retained_reaches(&db, 0, PROMPTLY).await;
+    }
+
+    #[tokio::test]
+    async fn terminate_ends_waiting_watches_with_retry_after_and_exits() {
+        let process = spawn_process();
+        let mut watches = Vec::new();
+        for _ in 0..3 {
+            watches.push(open_watch(process.server, &rand_mailbox()).await);
+        }
+        retained_reaches(&process.db, watches.len(), PROMPTLY).await;
+
+        process.terminate.send(()).unwrap();
+        for watch in watches {
+            let got = timeout(PROMPTLY, read_response(watch)).await.unwrap();
+            assert_eq!(got.status, 503);
+            assert!(got.head.contains("\r\nretry-after: 1"), "{}", got.head);
+        }
+        timeout(PROMPTLY, process.exited).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_hook_answered_200_at_terminate_reaches_its_watcher() {
+        const RACES: usize = 50;
+        let mut delivered = 0;
+        for _ in 0..RACES {
+            let process = spawn_process();
+            let mailbox = rand_mailbox();
+            let watch = open_watch(process.server, &mailbox).await;
+            retained_reaches(&process.db, 1, PROMPTLY).await;
+            let address = mailbox.hash().encode_hex::<String>();
+            let mut hook = send_raw(
+                process.server,
+                format!("POST /hook/{address} HTTP/1.1\r\nHost: test\r\nConnection: close\r\nContent-Length: 4\r\n\r\nbo").as_bytes(),
+            )
+            .await;
+            sleep(Duration::from_millis(20)).await;
+
+            hook.write_all(b"dy").await.unwrap();
+            process.terminate.send(()).unwrap();
+            let sent = timeout(PROMPTLY, try_read_response(hook)).await.unwrap();
+            let got = timeout(PROMPTLY, try_read_response(watch)).await.unwrap();
+            let got = got.expect("the watch got no response");
+            match sent.map(|sent| sent.status) {
+                Some(200) => {
+                    assert_eq!((got.status, got.body), (200, b"body".to_vec()));
+                    delivered += 1;
+                }
+                Some(404) | None => assert_eq!(got.status, 503),
+                Some(other) => panic!("hook got {other}"),
+            }
+            timeout(PROMPTLY, process.exited).await.unwrap().unwrap();
+        }
+        assert!(delivered > 0, "no race delivered before terminate");
+    }
+
+    #[tokio::test]
+    async fn watches_after_terminate_are_refused() {
+        let process = spawn_process();
+        let head = watch_head("/watch", &rand_mailbox());
+        let mut late = send_raw(process.server, head.as_bytes()).await;
+        let _stalled = send_raw(
+            process.server,
+            b"POST /hook/00 HTTP/1.1\r\nHost: test\r\nContent-Length: 2\r\n\r\n",
+        )
+        .await;
+        sleep(Duration::from_millis(200)).await;
+
+        process.terminate.send(()).unwrap();
+        timeout(PROMPTLY, async {
+            while TcpStream::connect(process.server).await.is_ok() {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        late.write_all(b"\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let got = timeout(PROMPTLY, read_response(late)).await.unwrap();
+        assert_eq!(got.status, 503);
+    }
+
+    #[tokio::test]
+    async fn stalled_clients_cannot_hold_exit_past_the_deadline() {
+        let process = spawn_process();
+        let watch = open_watch(process.server, &rand_mailbox()).await;
+        retained_reaches(&process.db, 1, PROMPTLY).await;
+
+        let not_reading = TcpSocket::new_v4().unwrap();
+        not_reading.set_recv_buffer_size(1024).unwrap();
+        let mut not_reading = not_reading.connect(process.server).await.unwrap();
+        let written = Arc::new(AtomicUsize::new(0));
+        let flood = tokio::spawn({
+            let written = written.clone();
+            async move {
+                let request = b"GET /watch HTTP/1.1\r\nHost: test\r\n\r\n";
+                while not_reading.write_all(request).await.is_ok() {
+                    written.fetch_add(request.len(), Ordering::Relaxed);
+                }
+            }
+        });
+        let mut before = usize::MAX;
+        while before != written.load(Ordering::Relaxed) {
+            before = written.load(Ordering::Relaxed);
+            sleep(Duration::from_millis(100)).await;
+        }
+        let _not_sending = send_raw(
+            process.server,
+            b"POST /hook/00 HTTP/1.1\r\nHost: test\r\nContent-Length: 2\r\n\r\n",
+        )
+        .await;
+
+        process.terminate.send(()).unwrap();
+        let terminated = Instant::now();
+        let got = timeout(PROMPTLY, read_response(watch)).await.unwrap();
+        assert_eq!(got.status, 503);
+        let exited = timeout(DRAIN_DEADLINE + 3 * PROMPTLY, process.exited)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(exited - terminated >= DRAIN_DEADLINE);
+        flood.abort();
     }
 }

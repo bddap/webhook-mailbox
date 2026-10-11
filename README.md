@@ -18,6 +18,10 @@ start watching before the webhook can fire. A watch waits for as long as its con
 open; closing the connection ends it. While the service is at its limit of waiting watches, a
 new watch gets a 429. Hook bodies are limited to 4 KiB; a larger one gets a 413.
 
+When the service restarts, every waiting watch ends with a 503 and a `Retry-After` header;
+watch again. Some proxies turn that 503 into a 504, so treat either as "watch again". A hook
+whose sender got a 200 has already been handed to its watcher.
+
 Client example:
 
 ```python
@@ -25,6 +29,7 @@ Client example:
 
 import secrets
 import hashlib
+import time
 import requests
 
 mailbox = secrets.token_bytes(32)
@@ -35,10 +40,14 @@ requests.post(
     json={"webhook_url": "https://webhook-mailbox.com/api/hook/" + address.hex()},
 )
 
-message = requests.get(
-    "https://webhook-mailbox.com/api/watch/",
-    headers={"Authorization": "Bearer " + mailbox.hex()},
-)
+while True:
+    message = requests.get(
+        "https://webhook-mailbox.com/api/watch/",
+        headers={"Authorization": "Bearer " + mailbox.hex()},
+    )
+    if message.status_code not in (503, 504):
+        break
+    time.sleep(int(message.headers.get("Retry-After", 1)))
 ```
 
 ## Current State

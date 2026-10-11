@@ -9,8 +9,8 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "toki
 hex = "0.4.3"
 sha2 = "0.10.9"
 socket2 = "0.6.5"
-tokio = { version = "1.53.2", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+tokio = { version = "1.53.2", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
 rand = "0.8.5"
-tokio = { version = "1.53.2", features = ["io-util", "time"] }
+tokio = { version = "1.53.2", features = ["io-util"] }

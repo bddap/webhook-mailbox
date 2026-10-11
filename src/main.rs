@@ -11,10 +11,8 @@ const LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 80
 async fn main() -> std::io::Result<()> {
     let listener = TcpListener::bind(LISTEN).await?;
     let mut terminate = signal(SignalKind::terminate())?;
-    // PID 1 ignores SIGTERM without a handler, and a graceful shutdown would wait on
-    // watches that never end.
-    tokio::select! {
-        served = endpoints::serve(listener, Default::default()) => served,
-        _ = terminate.recv() => Ok(()),
-    }
+    endpoints::serve(listener, Default::default(), async move {
+        terminate.recv().await;
+    })
+    .await
 }
