@@ -4,13 +4,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// Rocket keeps a handler running after its client disconnects, so an abandoned watch
-/// is only reclaimed by this timeout or a delivery; the two constants bound the state.
 pub const MAX_WATCHERS: usize = 10_000;
 pub const WATCH_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Holds only the watchers currently waiting; a hook body is handed straight to one of
-/// them and never stored.
 #[derive(Default)]
 pub struct Db {
     watchers: Mutex<Watchers>,

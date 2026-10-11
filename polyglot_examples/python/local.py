@@ -24,7 +24,6 @@ address = hashlib.sha256(mailbox).digest()
 
 
 def sender():
-    # The hook is only delivered once the watcher below is waiting.
     for _ in range(50):
         result = requests.post(
             mailbox_url + "/hook/" + address.hex(),
