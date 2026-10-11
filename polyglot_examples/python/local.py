@@ -29,7 +29,7 @@ def sender():
             mailbox_url + "/hook/" + address.hex(),
             json={"message": "hey!"},
         )
-        if result.status_code != 503:
+        if result.status_code != 404:
             break
         time.sleep(0.1)
     print("sender got:", result)

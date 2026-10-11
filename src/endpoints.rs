@@ -55,7 +55,8 @@ pub fn rocket_build(db: Db) -> Rocket<rocket::Build> {
 async fn watch(db: &State<Db>, bearer: MailboxKey) -> Result<Vec<u8>, Status> {
     db.receive(bearer).await.map_err(|e| match e {
         WatchError::TimedOut => Status::RequestTimeout,
-        WatchError::Full | WatchError::Closed => Status::ServiceUnavailable,
+        WatchError::Full => Status::TooManyRequests,
+        WatchError::Closed => Status::ServiceUnavailable,
     })
 }
 
@@ -74,7 +75,7 @@ async fn hook(
 
     db.send(address, bytes.value).map(|()| "ok").map_err(|_| {
         (
-            Status::ServiceUnavailable,
+            Status::NotFound,
             "nobody is watching this address".into(),
         )
     })
@@ -140,7 +141,7 @@ mod tests {
             .body(r#"{ "value": 42 }"#)
             .dispatch()
             .await;
-        assert_eq!(got.status(), Status::ServiceUnavailable);
+        assert_eq!(got.status(), Status::NotFound);
 
         let req = client.get("/watch").header(mailbox).dispatch();
         rocket::tokio::time::timeout(Duration::from_millis(200), req)
