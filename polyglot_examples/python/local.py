@@ -4,6 +4,7 @@ import secrets
 import hashlib
 import requests
 import threading
+import time
 import argparse
 
 parser = argparse.ArgumentParser(description="webhook-mailbox client example")
@@ -23,10 +24,14 @@ address = hashlib.sha256(mailbox).digest()
 
 
 def sender():
-    result = requests.post(
-        mailbox_url + "/hook/" + address.hex(),
-        json={"message": "hey!"},
-    )
+    for _ in range(50):
+        result = requests.post(
+            mailbox_url + "/hook/" + address.hex(),
+            json={"message": "hey!"},
+        )
+        if result.status_code != 503:
+            break
+        time.sleep(0.1)
     print("sender got:", result)
 
 
