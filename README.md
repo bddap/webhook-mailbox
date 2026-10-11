@@ -14,9 +14,9 @@ No need to set up an account. Your service can just allocate a mailbox at will.
 
 Nothing is stored. A webhook is delivered only to a client already waiting on `/watch` for
 its mailbox; otherwise the sender gets a 404 and the body is dropped. Delivery is best-effort:
-start watching before the webhook can fire. A watch that receives nothing for 30 seconds ends
-with a 408; watch again to keep waiting. While the service is at its limit of waiting watches,
-a new watch gets a 429.
+start watching before the webhook can fire. A watch waits for as long as its connection stays
+open; closing the connection ends it. While the service is at its limit of waiting watches, a
+new watch gets a 429. Hook bodies are limited to 4 KiB; a larger one gets a 413.
 
 Client example:
 

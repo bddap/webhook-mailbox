@@ -1,11 +1,9 @@
-use rocket::tokio::{sync::oneshot, time::timeout};
 use sha2::Digest;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
-use std::time::Duration;
+use tokio::sync::oneshot;
 
 pub const MAX_WATCHERS: usize = 10_000;
-pub const WATCH_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 pub struct Db {
@@ -18,12 +16,7 @@ struct Watchers {
     by_address: HashMap<Address, VecDeque<oneshot::Sender<Vec<u8>>>>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum WatchError {
-    Full,
-    TimedOut,
-    Closed,
-}
+pub struct Full;
 
 struct Registration<'a> {
     db: &'a Db,
@@ -48,23 +41,21 @@ impl Drop for Registration<'_> {
 }
 
 impl Db {
-    pub async fn receive(&self, mailbox_key: MailboxKey) -> Result<Vec<u8>, WatchError> {
+    pub async fn receive(&self, mailbox_key: MailboxKey) -> Result<Vec<u8>, Full> {
         let addr = mailbox_key.hash();
         let (tx, rx) = oneshot::channel();
         {
             let mut watchers = self.watchers.lock().unwrap();
             if watchers.count >= MAX_WATCHERS {
-                return Err(WatchError::Full);
+                return Err(Full);
             }
             watchers.count += 1;
             watchers.by_address.entry(addr).or_default().push_back(tx);
         }
         let mut registration = Registration { db: self, addr, rx };
-        match timeout(WATCH_TIMEOUT, &mut registration.rx).await {
-            Ok(Ok(body)) => Ok(body),
-            Ok(Err(_)) => Err(WatchError::Closed),
-            Err(_) => Err(WatchError::TimedOut),
-        }
+        Ok((&mut registration.rx)
+            .await
+            .expect("a waiting watch's sender is consumed only by send"))
     }
 
     pub fn send(&self, addr: Address, mut body: Vec<u8>) -> Result<(), Vec<u8>> {
@@ -126,45 +117,5 @@ impl MailboxKey {
         Address {
             addr: sha2::Sha256::digest(self.token).into(),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test(start_paused = true)]
-    async fn watches_never_dropped_are_capped_then_expire() {
-        let db: &'static Db = Box::leak(Box::default());
-        let watches: Vec<_> = (0..2 * MAX_WATCHERS)
-            .map(|_| {
-                let key = MailboxKey {
-                    token: rand::random(),
-                };
-                rocket::tokio::spawn(db.receive(key))
-            })
-            .collect();
-        rocket::tokio::time::sleep(Duration::from_millis(1)).await;
-        assert_eq!(db.retained(), MAX_WATCHERS);
-
-        let outcomes = rocket::tokio::time::timeout(2 * WATCH_TIMEOUT, async {
-            let mut outcomes = Vec::new();
-            for watch in watches {
-                outcomes.push(watch.await.unwrap());
-            }
-            outcomes
-        })
-        .await
-        .expect("every watch ends within the timeout");
-        let full = outcomes
-            .iter()
-            .filter(|o| **o == Err(WatchError::Full))
-            .count();
-        let timed_out = outcomes
-            .iter()
-            .filter(|o| **o == Err(WatchError::TimedOut))
-            .count();
-        assert_eq!((full, timed_out), (MAX_WATCHERS, MAX_WATCHERS));
-        assert_eq!(db.retained(), 0);
     }
 }
