@@ -37,10 +37,14 @@ def sender():
 
 threading.Thread(target=sender).start()
 
-result = requests.get(
-    mailbox_url + "/watch",
-    headers={"Authorization": "Bearer " + mailbox.hex()},
-)
+while True:
+    result = requests.get(
+        mailbox_url + "/watch",
+        headers={"Authorization": "Bearer " + mailbox.hex()},
+    )
+    if result.status_code not in (503, 504):
+        break
+    time.sleep(int(result.headers.get("Retry-After", 1)))
 print("watcher got:", result)
 print("watcher body:", result.text)
 assert result.status_code == 200
