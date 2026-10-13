@@ -1,8 +1,7 @@
-use std::future::{poll_fn, Future, IntoFuture};
+use std::future::{Future, IntoFuture};
 use std::os::fd::{AsFd, OwnedFd};
 use std::pin::pin;
 use std::sync::Arc;
-use std::task::Poll;
 use std::time::Duration;
 
 use axum::{
@@ -20,6 +19,7 @@ use axum::{
     serve::IncomingStream,
     Router,
 };
+use futures::future::{select, Either};
 use hex::FromHex;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{unix::AsyncFd, Interest};
@@ -137,19 +137,16 @@ async fn watch(
     key: MailboxKey,
 ) -> Result<Vec<u8>, Response> {
     let socket = socket.ok_or_else(try_again)?;
-    let mut received = pin!(db.receive(key));
-    let mut hung_up = pin!(hung_up(&socket));
-    poll_fn(|cx| match received.as_mut().poll(cx) {
-        Poll::Ready(received) => Poll::Ready(received.map_err(|unavailable| match unavailable {
-            Unavailable::Full => StatusCode::TOO_MANY_REQUESTS.into_response(),
-            Unavailable::Closing => try_again(),
-        })),
-        Poll::Pending => hung_up
-            .as_mut()
-            .poll(cx)
-            .map(|()| Err(StatusCode::BAD_REQUEST.into_response())),
-    })
-    .await
+    let received = pin!(db.receive(key));
+    let hung_up = pin!(hung_up(&socket));
+    match select(received, hung_up).await {
+        Either::Left((Ok(hook), _)) => Ok(hook),
+        Either::Left((Err(Unavailable::Full), _)) => {
+            Err(StatusCode::TOO_MANY_REQUESTS.into_response())
+        }
+        Either::Left((Err(Unavailable::Closing), _)) => Err(try_again()),
+        Either::Right(((), _)) => Err(StatusCode::BAD_REQUEST.into_response()),
+    }
 }
 
 async fn hook(

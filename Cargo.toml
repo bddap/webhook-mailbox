@@ -6,6 +6,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
+futures = { version = "0.3.34", default-features = false }
 hex = "0.4.3"
 sha2 = "0.10.9"
 socket2 = "0.6.5"
