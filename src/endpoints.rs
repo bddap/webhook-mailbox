@@ -1,7 +1,9 @@
 use std::future::{Future, IntoFuture};
-use std::os::fd::{AsFd, OwnedFd};
-use std::pin::pin;
+use std::io::{self, Read};
+use std::net::{Shutdown, SocketAddr};
+use std::pin::{pin, Pin};
 use std::sync::Arc;
+use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
 use axum::{
@@ -16,18 +18,18 @@ use axum::{
     },
     response::{IntoResponse, Response},
     routing::{get, post},
-    serve::IncomingStream,
+    serve::{IncomingStream, Listener},
     Router,
 };
 use futures::future::{select, Either};
 use hex::FromHex;
 use socket2::{SockRef, TcpKeepalive};
-use tokio::io::{unix::AsyncFd, Interest};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncWrite, Interest, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tokio::time::timeout;
 
-use crate::service::{Address, Db, MailboxKey, Unavailable};
+use crate::service::{Address, Db, MailboxKey, Unavailable, Undelivered};
 
 pub const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 const RETRY_AFTER_SECONDS: &str = "1";
@@ -56,29 +58,110 @@ impl<S: Send + Sync> FromRequestParts<S> for MailboxKey {
 }
 
 /// hyper stops reading a connection whose request body was left unread or that has
-/// bytes buffered past the request, so it never sees that client hang up. A duplicate
-/// of the socket watched for read-closed sees it regardless.
+/// bytes buffered past the request, so it never sees that client hang up. `/watch`
+/// waits on the same socket's readiness for read-closed, which arrives regardless.
 #[derive(Clone)]
-struct Peer(Option<Arc<AsyncFd<OwnedFd>>>);
+struct Peer(Arc<TcpStream>);
 
-impl Connected<IncomingStream<'_, TcpListener>> for Peer {
-    fn connect_info(stream: IncomingStream<'_, TcpListener>) -> Self {
-        let socket = stream
-            .io()
-            .as_fd()
-            .try_clone_to_owned()
-            .and_then(|fd| AsyncFd::with_interest(fd, Interest::READABLE));
-        if let Err(e) = &socket {
-            eprintln!("cannot watch {} for hangup: {e}", stream.remote_addr());
-        }
-        Peer(socket.ok().map(Arc::new))
+struct Connections(TcpListener);
+
+impl Listener for Connections {
+    type Io = Peer;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Peer, SocketAddr) {
+        let (stream, addr) = Listener::accept(&mut self.0).await;
+        (Peer(Arc::new(stream)), addr)
+    }
+
+    fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.0.local_addr()
     }
 }
 
-async fn hung_up(socket: &AsyncFd<OwnedFd>) {
+impl Connected<IncomingStream<'_, Connections>> for Peer {
+    fn connect_info(stream: IncomingStream<'_, Connections>) -> Self {
+        stream.io().clone()
+    }
+}
+
+/// `hung_up` clears the read readiness this stream shares, and `try_read` trusts
+/// cleared readiness without asking the socket, so each read asks the socket first.
+impl AsyncRead for Peer {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let mut read = (&*SockRef::from(&*self.0)).read(buf.initialize_unfilled());
+        loop {
+            match read {
+                Ok(n) => {
+                    buf.advance(n);
+                    return Poll::Ready(Ok(()));
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    ready!(self.0.poll_read_ready(cx))?;
+                    read = self.0.try_read(buf.initialize_unfilled());
+                }
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+    }
+}
+
+impl AsyncWrite for Peer {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            match self.0.try_write(buf) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    ready!(self.0.poll_write_ready(cx))?
+                }
+                written => return Poll::Ready(written),
+            }
+        }
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        loop {
+            match self.0.try_write_vectored(bufs) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    ready!(self.0.poll_write_ready(cx))?
+                }
+                written => return Poll::Ready(written),
+            }
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(SockRef::from(&*self.0).shutdown(Shutdown::Write))
+    }
+}
+
+async fn hung_up(socket: &TcpStream) {
     loop {
-        match socket.readable().await {
-            Ok(mut ready) if !ready.ready().is_read_closed() => ready.clear_ready(),
+        match socket.ready(Interest::READABLE).await {
+            Ok(ready) if !ready.is_read_closed() => {
+                let _ = socket.try_io(Interest::READABLE, || {
+                    Err::<(), _>(io::ErrorKind::WouldBlock.into())
+                });
+            }
             _ => return,
         }
     }
@@ -104,7 +187,7 @@ pub async fn serve(
     let stop_serving = Arc::new(Notify::new());
     let server = tokio::spawn(
         axum::serve(
-            listener,
+            Connections(listener),
             router.into_make_service_with_connect_info::<Peer>(),
         )
         .with_graceful_shutdown({
@@ -136,7 +219,6 @@ async fn watch(
     ConnectInfo(Peer(socket)): ConnectInfo<Peer>,
     key: MailboxKey,
 ) -> Result<Vec<u8>, Response> {
-    let socket = socket.ok_or_else(try_again)?;
     let received = pin!(db.receive(key));
     let hung_up = pin!(hung_up(&socket));
     match select(received, hung_up).await {
@@ -153,17 +235,19 @@ async fn hook(
     State(db): State<Arc<Db>>,
     Path(address): Path<String>,
     body: Bytes,
-) -> Result<&'static str, (StatusCode, String)> {
-    let addr =
-        <[u8; 32]>::from_hex(&address).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    db.send(Address { addr }, body.to_vec())
-        .map(|()| "ok")
-        .map_err(|_| {
-            (
-                StatusCode::NOT_FOUND,
-                "nobody is watching this address".into(),
-            )
-        })
+) -> Result<&'static str, Response> {
+    let addr = <[u8; 32]>::from_hex(&address)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()).into_response())?;
+    match db.send(Address { addr }, body.to_vec()).await {
+        Ok(()) => Ok("ok"),
+        Err(Undelivered::Unwatched) => {
+            Err((StatusCode::NOT_FOUND, "nobody is watching this address").into_response())
+        }
+        Err(Undelivered::Unavailable(Unavailable::Full)) => {
+            Err(StatusCode::TOO_MANY_REQUESTS.into_response())
+        }
+        Err(Undelivered::Unavailable(Unavailable::Closing)) => Err(try_again()),
+    }
 }
 
 #[cfg(test)]
@@ -177,7 +261,7 @@ mod tests {
     use tokio::time::{sleep, Instant};
 
     use super::*;
-    use crate::service::MAX_WATCHERS;
+    use crate::service::{MAX_WATCHERS, REARM_WINDOW};
 
     const MANY_REQUESTS: usize = 20_000;
     const PROMPTLY: Duration = Duration::from_secs(1);
@@ -329,7 +413,6 @@ mod tests {
         assert_eq!((sent.status, sent.body.as_slice()), (200, &b"ok"[..]));
         let got = read_response(watch).await;
         assert_eq!((got.status, got.body), (200, body));
-        assert_eq!(db.retained(), 0);
     }
 
     #[tokio::test]
@@ -343,6 +426,98 @@ mod tests {
         let sent = request(server, &format!("POST /hook/{address}/ HTTP/1.1"), b"x").await;
         assert_eq!(sent.status, 200);
         assert_eq!(read_response(watch).await.body, b"x");
+    }
+
+    async fn deliver_once(server: SocketAddr, db: &Db, mailbox: &MailboxKey) {
+        let watch = open_watch(server, mailbox).await;
+        retained_reaches(db, 1, PROMPTLY).await;
+        assert_eq!(
+            post_hook(server, &mailbox.hash(), b"first").await.status,
+            200
+        );
+        assert_eq!(read_response(watch).await.body, b"first");
+    }
+
+    #[tokio::test]
+    async fn a_hook_landing_while_its_watcher_rearms_is_delivered() {
+        let (server, db) = spawn_server().await;
+        let mailbox = rand_mailbox();
+        deliver_once(server, &db, &mailbox).await;
+
+        let address = mailbox.hash();
+        let second = tokio::spawn(async move { post_hook(server, &address, b"second").await });
+        retained_reaches(&db, 2, PROMPTLY).await;
+        let got = read_response(open_watch(server, &mailbox).await).await;
+        assert_eq!((got.status, got.body), (200, b"second".to_vec()));
+        assert_eq!(second.await.unwrap().status, 200);
+    }
+
+    #[tokio::test]
+    async fn a_hook_waits_for_rearm_no_longer_than_the_window() {
+        let (server, db) = spawn_server().await;
+        let mailbox = rand_mailbox();
+        deliver_once(server, &db, &mailbox).await;
+
+        let posted = Instant::now();
+        let got = post_hook(server, &mailbox.hash(), b"second").await;
+        assert_eq!(got.status, 404);
+        assert!(posted.elapsed() >= REARM_WINDOW - PROMPTLY);
+        retained_reaches(&db, 0, PROMPTLY).await;
+        let got = timeout(PROMPTLY, post_hook(server, &mailbox.hash(), b"third")).await;
+        assert_eq!(got.unwrap().status, 404);
+    }
+
+    #[tokio::test]
+    async fn a_hook_waiting_for_rearm_at_terminate_gets_retry_after() {
+        let process = spawn_process();
+        let mailbox = rand_mailbox();
+        deliver_once(process.server, &process.db, &mailbox).await;
+
+        let address = mailbox.hash().encode_hex::<String>();
+        let hook = send_request(
+            process.server,
+            &format!("POST /hook/{address} HTTP/1.1"),
+            b"second",
+        )
+        .await;
+        retained_reaches(&process.db, 2, PROMPTLY).await;
+        process.terminate.send(()).unwrap();
+        let got = timeout(PROMPTLY, read_response(hook)).await.unwrap();
+        assert_eq!(got.status, 503);
+        assert!(got.head.contains("\r\nretry-after: 1"), "{}", got.head);
+    }
+
+    #[tokio::test]
+    async fn requests_pipelined_behind_a_waiting_watch_are_answered() {
+        let (server, db) = spawn_server().await;
+        let mailbox = rand_mailbox();
+        let head = watch_head("/watch", &mailbox);
+        let mut conn = send_raw(server, format!("{head}\r\nHost: test\r\n\r\n").as_bytes()).await;
+        retained_reaches(&db, 1, PROMPTLY).await;
+        for last in ["", "Connection: close\r\n"] {
+            let request = format!("GET /watch HTTP/1.1\r\nHost: test\r\n{last}\r\n");
+            conn.write_all(request.as_bytes()).await.unwrap();
+            sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(post_hook(server, &mailbox.hash(), b"x").await.status, 200);
+        let mut raw = Vec::new();
+        timeout(PROMPTLY, conn.read_to_end(&mut raw))
+            .await
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        assert_eq!(text.matches("HTTP/1.1 ").count(), 3, "{text}");
+    }
+
+    #[tokio::test]
+    async fn repeated_deliveries_to_one_mailbox_hold_one_lease() {
+        const DELIVERIES: usize = 100;
+        let (server, db) = spawn_server().await;
+        let mailbox = rand_mailbox();
+        for _ in 0..DELIVERIES {
+            deliver_once(server, &db, &mailbox).await;
+        }
+        assert_eq!(db.retained(), 1);
     }
 
     #[tokio::test]
@@ -488,7 +663,7 @@ mod tests {
                     assert_eq!((got.status, got.body), (200, b"body".to_vec()));
                     delivered += 1;
                 }
-                Some(404) | None => assert_eq!(got.status, 503),
+                Some(503) | None => assert_eq!(got.status, 503),
                 Some(other) => panic!("hook got {other}"),
             }
             timeout(PROMPTLY, process.exited).await.unwrap().unwrap();

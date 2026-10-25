@@ -12,15 +12,18 @@ sequenceDiagram
 
 No need to set up an account. Your service can just allocate a mailbox at will.
 
-Nothing is stored. A webhook is delivered only to a client already waiting on `/watch` for
-its mailbox; otherwise the sender gets a 404 and the body is dropped. Delivery is best-effort:
-start watching before the webhook can fire. A watch waits for as long as its connection stays
-open; closing the connection ends it. While the service is at its limit of waiting watches, a
-new watch gets a 429. Hook bodies are limited to 4 KiB; a larger one gets a 413.
+Nothing is stored. A webhook is delivered only to a client watching its mailbox on `/watch`;
+otherwise the sender gets a 404 and the body is dropped. Delivery is best-effort: start watching
+before the webhook can fire. For 5 seconds after a mailbox delivers, a webhook to it with nobody
+watching is held open for up to 5 seconds until the client watches again, so a client that
+re-watches right away misses nothing in between. The sender's 200 still means the hook reached
+a watcher. A watch waits for as long as its connection stays open; closing the connection ends
+it. While the service is at its limit of waiting watches and hooks, a new one gets a 429. Hook
+bodies are limited to 4 KiB; a larger one gets a 413.
 
-When the service restarts, every waiting watch ends with a 503 and a `Retry-After` header;
-watch again. Some proxies turn that 503 into a 504, so treat either as "watch again". A hook
-whose sender got a 200 has already been handed to its watcher.
+When the service restarts, every waiting watch and hook ends with a 503 and a `Retry-After`
+header; send it again. Some proxies turn that 503 into a 504, so treat either as "try again". A
+hook whose sender got a 200 has already been handed to its watcher.
 
 Client example:
 
