@@ -1,5 +1,5 @@
 use std::future::{Future, IntoFuture};
-use std::io;
+use std::io::{self, Read};
 use std::net::{Shutdown, SocketAddr};
 use std::pin::{pin, Pin};
 use std::sync::Arc;
@@ -85,22 +85,24 @@ impl Connected<IncomingStream<'_, Connections>> for Peer {
     }
 }
 
-/// Every read tries the socket before waiting on readiness, because `hung_up`
-/// clears the readiness it shares with this stream.
+/// `hung_up` clears the read readiness this stream shares, and `try_read` trusts
+/// cleared readiness without asking the socket, so each read asks the socket first.
 impl AsyncRead for Peer {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        let mut read = (&*SockRef::from(&*self.0)).read(buf.initialize_unfilled());
         loop {
-            match self.0.try_read(buf.initialize_unfilled()) {
+            match read {
                 Ok(n) => {
                     buf.advance(n);
                     return Poll::Ready(Ok(()));
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    ready!(self.0.poll_read_ready(cx))?
+                    ready!(self.0.poll_read_ready(cx))?;
+                    read = self.0.try_read(buf.initialize_unfilled());
                 }
                 Err(e) => return Poll::Ready(Err(e)),
             }
@@ -483,6 +485,39 @@ mod tests {
         let got = timeout(PROMPTLY, read_response(hook)).await.unwrap();
         assert_eq!(got.status, 503);
         assert!(got.head.contains("\r\nretry-after: 1"), "{}", got.head);
+    }
+
+    #[tokio::test]
+    async fn requests_pipelined_behind_a_waiting_watch_are_answered() {
+        let (server, db) = spawn_server().await;
+        let mailbox = rand_mailbox();
+        let head = watch_head("/watch", &mailbox);
+        let mut conn = send_raw(server, format!("{head}\r\nHost: test\r\n\r\n").as_bytes()).await;
+        retained_reaches(&db, 1, PROMPTLY).await;
+        for last in ["", "Connection: close\r\n"] {
+            let request = format!("GET /watch HTTP/1.1\r\nHost: test\r\n{last}\r\n");
+            conn.write_all(request.as_bytes()).await.unwrap();
+            sleep(Duration::from_millis(200)).await;
+        }
+        assert_eq!(post_hook(server, &mailbox.hash(), b"x").await.status, 200);
+        let mut raw = Vec::new();
+        timeout(PROMPTLY, conn.read_to_end(&mut raw))
+            .await
+            .unwrap()
+            .unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        assert_eq!(text.matches("HTTP/1.1 ").count(), 3, "{text}");
+    }
+
+    #[tokio::test]
+    async fn repeated_deliveries_to_one_mailbox_hold_one_lease() {
+        const DELIVERIES: usize = 100;
+        let (server, db) = spawn_server().await;
+        let mailbox = rand_mailbox();
+        for _ in 0..DELIVERIES {
+            deliver_once(server, &db, &mailbox).await;
+        }
+        assert_eq!(db.retained(), 1);
     }
 
     #[tokio::test]

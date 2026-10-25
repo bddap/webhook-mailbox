@@ -5,7 +5,7 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::{timeout, Instant};
 
-/// Bounds everything held at once: waiting watches, waiting hooks and re-arm leases.
+/// Bounds the requests held open at once: waiting watches and waiting hooks.
 pub const MAX_WATCHERS: usize = 10_000;
 /// How long after a delivery its address keeps hooks waiting for the watcher to re-arm.
 pub const REARM_WINDOW: Duration = Duration::from_secs(5);
@@ -33,7 +33,7 @@ struct Watchers {
 struct Mailbox {
     watches: VecDeque<oneshot::Sender<Vec<u8>>>,
     hooks: VecDeque<Hook>,
-    leases: usize,
+    leased_until: Option<Instant>,
 }
 
 struct Hook {
@@ -43,28 +43,40 @@ struct Hook {
 
 impl Mailbox {
     fn len(&self) -> usize {
-        self.watches.len() + self.hooks.len() + self.leases
+        self.watches.len() + self.hooks.len()
+    }
+
+    fn leased(&self, now: Instant) -> bool {
+        self.leased_until.is_some_and(|until| until > now)
     }
 }
 
 impl Watchers {
+    /// Each leased address has one entry in `leases`; a renewal re-queues it on expiry,
+    /// so the deque is only roughly ordered and `Mailbox::leased` is what admits hooks.
     fn expire_leases(&mut self, now: Instant) {
         while let Some(&(deadline, addr)) = self.leases.front() {
             if deadline > now {
                 break;
             }
             self.leases.pop_front();
-            self.by_address.get_mut(&addr).unwrap().leases -= 1;
-            self.count -= 1;
-            self.remove_if_empty(addr);
+            let mailbox = self.by_address.get_mut(&addr).unwrap();
+            match mailbox.leased_until {
+                Some(until) if until > now => self.leases.push_back((until, addr)),
+                _ => {
+                    mailbox.leased_until = None;
+                    self.remove_if_empty(addr);
+                }
+            }
         }
     }
 
-    /// Called only after taking one entry, so the lease cannot push `count` past the cap.
     fn lease(&mut self, addr: Address) {
-        self.count += 1;
-        self.by_address.entry(addr).or_default().leases += 1;
-        self.leases.push_back((Instant::now() + REARM_WINDOW, addr));
+        let until = Instant::now() + REARM_WINDOW;
+        let mailbox = self.by_address.entry(addr).or_default();
+        if mailbox.leased_until.replace(until).is_none() {
+            self.leases.push_back((until, addr));
+        }
     }
 
     fn take_hook(&mut self, addr: Address) -> Option<Vec<u8>> {
@@ -107,7 +119,11 @@ impl Watchers {
     }
 
     fn remove_if_empty(&mut self, addr: Address) {
-        if self.by_address.get(&addr).is_some_and(|m| m.len() == 0) {
+        if self
+            .by_address
+            .get(&addr)
+            .is_some_and(|m| m.len() == 0 && m.leased_until.is_none())
+        {
             self.by_address.remove(&addr);
         }
     }
@@ -182,7 +198,12 @@ impl Db {
             let Err(body) = watchers.deliver(addr, body) else {
                 return Ok(false);
             };
-            if watchers.by_address.get(&addr).is_none_or(|m| m.leases == 0) {
+            let now = Instant::now();
+            if !watchers
+                .by_address
+                .get(&addr)
+                .is_some_and(|m| m.leased(now))
+            {
                 return Err(Undelivered::Unwatched);
             }
             if watchers.count >= MAX_WATCHERS {
@@ -218,17 +239,20 @@ impl Db {
     pub fn retained(&self) -> usize {
         self.with(|watchers| {
             let held: Vec<usize> = watchers.by_address.values().map(Mailbox::len).collect();
-            assert!(!held.contains(&0));
+            assert!(watchers
+                .by_address
+                .values()
+                .all(|m| m.len() > 0 || m.leased_until.is_some()));
             assert_eq!(watchers.count, held.iter().sum::<usize>());
             assert_eq!(
                 watchers.leases.len(),
                 watchers
                     .by_address
                     .values()
-                    .map(|m| m.leases)
-                    .sum::<usize>()
+                    .filter(|m| m.leased_until.is_some())
+                    .count()
             );
-            watchers.count
+            watchers.count + watchers.leases.len()
         })
         .unwrap_or(0)
     }
